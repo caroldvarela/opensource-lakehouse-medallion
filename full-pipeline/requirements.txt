@@ -1,0 +1,16 @@
+apache-airflow-providers-apache-spark==4.10.0
+apache-airflow-providers-openlineage>=1.8.0
+pyspark==3.5.2
+numpy
+pandas
+urllib3
+boto3
+sodapy
+dlt[filesystem]
+s3fs
+pyarrow==21.0.0
+pandas
+aiobotocore==2.24.2
+boto3==1.40.18
+botocore==1.40.18
+s3transfer==0.13.1

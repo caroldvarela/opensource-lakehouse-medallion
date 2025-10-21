@@ -1,0 +1,184 @@
+from pyspark.sql.functions import input_file_name, regexp_extract, current_timestamp
+from pyspark.sql import SparkSession
+import time
+
+CATALOG_URI = "http://nessie:19120/api/v1"
+WAREHOUSE = "s3a://silver/"
+STORAGE_URI = "http://minio:9000"
+AWS_ACCESS_KEY = "admin"
+AWS_SECRET_KEY = "password"
+
+# ======================
+# 1. Spark + Nessie Configuration
+# ======================
+spark = (
+    SparkSession.builder
+    .appName("spark_silver")
+    .master("spark://spark-master:7077")
+    # Iceberg + Nessie configuration
+    .config("spark.sql.extensions",
+            "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions,"
+            "org.projectnessie.spark.extensions.NessieSparkSessionExtensions")
+    .config("spark.sql.catalog.nessie", "org.apache.iceberg.spark.SparkCatalog")
+    .config("spark.sql.catalog.nessie.uri", CATALOG_URI)
+    .config("spark.sql.catalog.nessie.ref", "main")
+    .config("spark.sql.catalog.nessie.authentication.type", "NONE")
+    .config("spark.sql.catalog.nessie.catalog-impl", "org.apache.iceberg.nessie.NessieCatalog")
+    .config("spark.sql.catalog.nessie.s3.endpoint", STORAGE_URI)
+    .config("spark.sql.catalog.nessie.warehouse", WAREHOUSE)
+    .config("spark.sql.catalog.nessie.io-impl", "org.apache.iceberg.hadoop.HadoopFileIO")
+    # S3/MinIO configuration
+    .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
+    .config("spark.hadoop.fs.s3a.endpoint", STORAGE_URI)
+    .config("spark.hadoop.fs.s3a.access.key", AWS_ACCESS_KEY)
+    .config("spark.hadoop.fs.s3a.secret.key", AWS_SECRET_KEY)
+    .config("spark.hadoop.fs.s3a.path.style.access", "true")
+    .config("spark.hadoop.fs.s3a.aws.credentials.provider",
+            "org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider")
+    # Memory optimization
+    .config("spark.sql.adaptive.enabled", "true")
+    .config("spark.sql.adaptive.coalescePartitions.enabled", "true")
+    .config("spark.sql.adaptive.skewJoin.enabled", "true")
+    .config("spark.serializer", "org.apache.spark.serializer.KryoSerializer")
+    .config("spark.sql.execution.arrow.pyspark.enabled", "true")
+    .getOrCreate()
+)
+
+# ======================
+# 2. Read Bronze Data
+# ======================
+bronze_path = "s3a://bronze/stackoverflow"
+
+# Adjust patterns to read from subfolders
+tables = {
+    "posts": f"{bronze_path}/posts_*/*.parquet",
+    "votes": f"{bronze_path}/votes_*/*.parquet",
+    "comments": f"{bronze_path}/comments_*/*.parquet",
+    "users": f"{bronze_path}/users/*.parquet",
+    "postlinks": f"{bronze_path}/postlinks/*.parquet",
+    "posthistory": f"{bronze_path}/posthistory_*/*.parquet",
+    "badges": f"{bronze_path}/badges/*.parquet"
+}
+
+# Note: 'badges' removed if not present in the bucket
+
+# ======================
+# 3. Generic Function: Normalize + Merge into Silver
+# ======================
+def write_silver(table_name, df, pk="Id"):
+    """Load a Silver table into Iceberg with MERGE INTO"""
+    target_table = f"nessie.silver.{table_name}"
+    
+    try:
+        print(f"Processing {table_name} - Rows: {df.count()}")
+        
+        # Only deduplicate to avoid determinism issues
+        df_silver = df.dropDuplicates([pk])
+        print(f"After deduplication: {df_silver.count()} rows")
+
+        if not spark.catalog.tableExists(target_table):
+            print(f"Creating new table: {target_table}")
+            # Add load timestamp only on initial creation
+            df_with_timestamp = df_silver.withColumn("load_date", current_timestamp())
+            (
+                df_with_timestamp.writeTo(target_table)
+                .tableProperty("format-version", "2")
+                .create()
+            )
+            print(f"Table created: {target_table}")
+        else:
+            print(f"Updating existing table: {target_table}")
+            # Use only original columns without load_date for MERGE
+            temp_view = f"staging_{table_name}"
+            df_silver.createOrReplaceTempView(temp_view)
+
+            columns = [col for col in df_silver.columns if col != "load_date"]
+            update_columns = ", ".join([f"t.{col} = s.{col}" for col in columns])
+            insert_columns = ", ".join(columns)
+            insert_values = ", ".join([f"s.{col}" for col in columns])
+
+            merge_sql = f"""
+                MERGE INTO {target_table} t
+                USING {temp_view} s
+                ON t.{pk} = s.{pk}
+                WHEN MATCHED THEN UPDATE SET {update_columns}
+                WHEN NOT MATCHED THEN INSERT ({insert_columns}) VALUES ({insert_values})
+            """
+            print(f"Executing MERGE SQL for {target_table}")
+            spark.sql(merge_sql)
+            print(f"Table updated with MERGE: {target_table}")
+            
+    except Exception as e:
+        print(f"Error processing {table_name}: {str(e)}")
+        raise e
+
+# ======================
+# 4. Create Silver Namespace in Nessie
+# ======================
+spark.sql("CREATE NAMESPACE IF NOT EXISTS nessie.silver")
+
+# ======================
+# 5. Process All Tables
+# ======================
+
+# Tables partitioned by year → extract "year" from filename
+def read_with_year(path, regex=".*_(\\d+)\\/.*"):
+    df = spark.read.parquet(path)
+    print(f"Reading {path}: {df.count()} rows")
+    
+    # Add year column and materialize by writing to a temporary table
+    df_with_year = df.withColumn("year", regexp_extract(input_file_name(), regex, 1))
+    
+    temp_table_name = f"temp_posts_{int(time.time())}"
+    temp_table = f"nessie.silver.{temp_table_name}"
+    
+    try:
+        # Write to temporary table to materialize the data
+        df_with_year.writeTo(temp_table).create()
+        # Read back the materialized data
+        materialized_df = spark.read.table(temp_table)
+        return materialized_df
+    finally:
+        # Clean up the temporary table
+        try:
+            spark.sql(f"DROP TABLE IF EXISTS {temp_table}")
+        except:
+            pass  # Ignore cleanup errors
+
+# Process tables one by one for memory optimization
+print("Processing table: posts")
+df_posts = read_with_year(tables["posts"])
+write_silver("posts", df_posts, pk="Id")
+df_posts.unpersist()
+
+print("Processing table: votes")
+df_votes = read_with_year(tables["votes"])
+write_silver("votes", df_votes, pk="Id")
+df_votes.unpersist()
+
+print("Processing table: comments")
+df_comments = read_with_year(tables["comments"])
+write_silver("comments", df_comments, pk="Id")
+df_comments.unpersist()
+
+print("Processing table: posthistory")
+df_posthistory = read_with_year(tables["posthistory"])
+write_silver("posthistory", df_posthistory, pk="Id")
+df_posthistory.unpersist()
+
+# Tables without year → no year column
+print("Processing table: users")
+df_users = spark.read.parquet(tables["users"])
+print(f"Reading users: {df_users.count()} rows")
+write_silver("users", df_users, pk="Id")
+
+print("Processing table: postlinks")
+df_postlinks = spark.read.parquet(tables["postlinks"])
+print(f"Reading postlinks: {df_postlinks.count()} rows")
+write_silver("postlinks", df_postlinks, pk="Id")
+
+print("Processing table: badges")
+df_badges = spark.read.parquet(tables["badges"])
+write_silver("badges", df_badges, pk="Id")
+
+print("All Silver tables loaded into Iceberg with Nessie")

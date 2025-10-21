@@ -1,0 +1,29 @@
+# Imagen base de Airflow
+FROM apache/airflow:2.10.0
+
+# ---------- instalar Java y utilidades ----------
+USER root
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && \
+    apt-get install -y openjdk-17-jdk procps wget curl tar gzip ca-certificates && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+ENV JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+ENV PATH="${JAVA_HOME}/bin:${PATH}"
+
+# ---------- instalar Spark ----------
+ENV SPARK_VERSION=3.5.2
+ENV HADOOP_PROFILE=hadoop3
+ENV SPARK_HOME=/opt/spark
+ENV PATH="${SPARK_HOME}/bin:${JAVA_HOME}/bin:/home/airflow/.local/bin:${PATH}"
+
+RUN curl -fsSL "https://archive.apache.org/dist/spark/spark-${SPARK_VERSION}/spark-${SPARK_VERSION}-bin-${HADOOP_PROFILE}.tgz" -o /tmp/spark.tgz \
+ && mkdir -p ${SPARK_HOME} \
+ && tar -xzf /tmp/spark.tgz -C ${SPARK_HOME} --strip-components=1 \
+ && rm /tmp/spark.tgz
+
+# ---------- instalar dependencias Python ----------
+USER airflow
+COPY requirements.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir -r /tmp/requirements.txt

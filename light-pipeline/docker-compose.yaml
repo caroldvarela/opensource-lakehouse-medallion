@@ -1,0 +1,176 @@
+x-spark-common: &spark-common
+  image: bitnami/spark:3.5.2
+  volumes:
+    - ./jobs:/opt/spark/jobs
+    - ./dlt:/opt/spark/dlt
+  networks:
+    - data-stack-g4
+
+x-airflow-common: &airflow-common
+  env_file:
+    - airflow.env
+  environment:
+    - PYTHONPATH=/opt/airflow/jobs
+    - DLT_CONFIG_DIR=/opt/airflow/.dlt
+  volumes:
+    - ./jobs:/opt/airflow/jobs
+    - ./dags:/opt/airflow/dags
+    - ./logs:/opt/airflow/logs
+    - ./dlt:/opt/airflow/.dlt
+    - ./dlt:/home/airflow/.dlt
+  depends_on:
+    - postgres
+  networks:
+    - data-stack-g4
+
+services:
+  # Spark Master
+  spark-master:
+    <<: *spark-common
+    container_name: spark_master_g4
+    command: bin/spark-class org.apache.spark.deploy.master.Master
+    ports:
+      - "9090:8080"  # Spark Web Interface
+      - "7077:7077"  # Spark Master Port
+    environment:
+      - AWS_REGION=us-east-1
+      - AWS_ACCESS_KEY_ID=admin
+      - AWS_SECRET_ACCESS_KEY=password  
+
+  # Spark Worker
+  spark-worker:
+    <<: *spark-common
+    container_name: spark_worker_g4
+    command: bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077
+    depends_on:
+      - spark-master
+    environment:
+      - "SPARK_MODE=worker"
+      - "SPARK_WORKER_CORES=4"
+      - "SPARK_WORKER_MEMORY=4g"
+      - "SPARK_MASTER_URL=spark://spark-master:7077"
+      - "AWS_REGION=us-east-1"
+      - "AWS_ACCESS_KEY_ID=admin"
+      - "AWS_SECRET_ACCESS_KEY=password"
+
+  postgres:
+    image: postgres:14.0
+    container_name: postgres_airflow_g4
+    environment:
+      - POSTGRES_USER=airflow
+      - POSTGRES_PASSWORD=airflow
+      - POSTGRES_DB=airflow
+    networks:
+      - data-stack-g4
+    volumes:
+      - postgres_data_g4:/var/lib/postgresql/data
+
+  webserver:
+    <<: *airflow-common
+    image: carolvarela/light-pipeline-webserver:1.0
+    container_name: airflow_webserver_g4
+    entrypoint: /entrypoint
+    command: webserver
+    ports:
+      - "8080:8080"
+    depends_on:
+      - scheduler
+    environment:
+      - SPARK_MASTER=spark://spark-master:7077
+      - SPARK_DRIVER_HOST=webserver
+      - SPARK_DRIVER_BIND_ADDRESS=0.0.0.0
+
+  scheduler:
+    <<: *airflow-common
+    image: carolvarela/light-pipeline-scheduler:1.0
+    container_name: airflow_scheduler_g4
+    entrypoint: /entrypoint
+    command: >
+      bash -c "
+      airflow db migrate &&
+      airflow users create --username admin --firstname Admin --lastname User --role Admin --email admin@example.com --password admin &&
+      airflow scheduler"
+    environment:
+      - SPARK_MASTER=spark://spark-master:7077
+      - SPARK_DRIVER_HOST=scheduler
+      - SPARK_DRIVER_BIND_ADDRESS=0.0.0.0
+
+  # MinIO
+  minio:
+    image: quay.io/minio/minio
+    container_name: minio_project_g4
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - ./minio-data:/data
+    environment:
+      - MINIO_ROOT_USER=admin
+      - MINIO_ROOT_PASSWORD=password
+      - MINIO_REGION=us-east-1
+    entrypoint: >
+      /bin/sh -c "
+      minio server /data --console-address ':9001' &
+      sleep 10;
+      mc alias set myminio http://localhost:9000 admin password;
+      mc mb myminio/my-bucket --ignore-existing;
+      mc mb myminio/bronze --ignore-existing;
+      mc mb myminio/silver --ignore-existing;
+      mc mb myminio/gold --ignore-existing;
+      tail -f /dev/null"
+    networks:
+      - data-stack-g4
+
+  # Nessie
+  nessie:
+    image: projectnessie/nessie:latest
+    container_name: nessie_data_stack_g4
+    environment:
+      - QUARKUS_PROFILE=prod
+      - QUARKUS_HTTP_PORT=19120
+      - QUARKUS_LOG_CONSOLE_FORMAT=%d{yyyy-MM-dd HH:mm:ss} %-5p [%c{1.}] (%t) %s%e%n
+      - QUARKUS_LOG_LEVEL=INFO
+    volumes:
+      - ./nessie_storage:/nessie/data
+    ports:
+      - "19120:19120"
+    networks:
+      - data-stack-g4
+
+  # Dremio
+  dremio:
+    platform: linux/x86_64
+    image: dremio/dremio-oss:25.2
+    container_name: dremio_data_stack_g4
+    ports:
+      - 9047:9047
+      - 31010:31010
+      - 32010:32010
+    environment:
+      - DREMIO_JAVA_SERVER_EXTRA_OPTS=-Dpaths.dist=file:///opt/dremio/data/dist
+    networks:
+      - data-stack-g4
+
+  trino:
+    image: trinodb/trino:latest
+    container_name: trino_g4
+    ports:
+      - "8081:8080"
+    volumes:
+      - ./trino/catalog:/etc/trino/catalog
+      - ./trino/config:/etc/trino/config
+      - ./trino/auth:/etc/trino/auth
+    environment:
+      TRINO_USER: admin
+      TRINO_PASSWORD: password
+    networks:
+      - data-stack-g4
+
+networks:
+  data-stack-g4:
+
+volumes:
+  postgres_data_g4:
+  minio-data-g4:
+  notebooks-g4:
+  nessie-data-g4:
